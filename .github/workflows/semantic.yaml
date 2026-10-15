@@ -1,0 +1,22 @@
+name: Semantic version tag
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - .github/workflows/semantic.yaml
+      - .github/workflows/semantic_reusable.yaml
+      - GitVersion.yml
+      - GitVersion.yaml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  semantic:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    uses: ./.github/workflows/semantic_reusable.yaml
+    with:
+      dry_run: ${{ github.event_name == 'pull_request' }}
