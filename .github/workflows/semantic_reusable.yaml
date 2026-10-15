@@ -1,0 +1,156 @@
+# Local copy of vargatas/Central-workflows v1.0.1 (f35c8ffce7a5102dbc97ec50f8888701604a33f2).
+# Public repositories cannot call a private reusable workflow.
+name: Semantic tagging (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      gitversion_version:
+        description: Exact GitVersion tool version to install
+        type: string
+        required: false
+        default: '6.8.2'
+      runner:
+        description: Runner label (with support for Node.js 24 actions)
+        type: string
+        required: false
+        default: ubuntu-latest
+      config_file:
+        description: Optional GitVersion configuration path in the caller repository
+        type: string
+        required: false
+        default: ''
+      dry_run:
+        description: Calculate and report the tag without creating it
+        type: boolean
+        required: false
+        default: false
+    outputs:
+      version:
+        description: Calculated semantic version without the v prefix
+        value: ${{ jobs.semantic.outputs.version }}
+      tag:
+        description: Calculated tag including the v prefix
+        value: ${{ jobs.semantic.outputs.tag }}
+      tag_created:
+        description: String true if this run created a tag, otherwise false
+        value: ${{ jobs.semantic.outputs.tag_created }}
+
+permissions:
+  contents: write
+
+jobs:
+  semantic:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 15
+    concurrency:
+      group: central-semantic-${{ github.repository }}-${{ github.ref }}-${{ inputs.dry_run }}
+      cancel-in-progress: false
+      queue: max
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
+      tag: ${{ steps.tag.outputs.tag }}
+      tag_created: ${{ steps.tag.outputs.tag_created }}
+    steps:
+      # In a reusable workflow checkout checks out the CALLER repository.
+      - name: Check out the calling commit with all history and tags
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install GitVersion
+        uses: GitTools/actions/gitversion/setup@7417b1089e2c7de93510f1901d656ddf60bb024f # v4.7.0
+        with:
+          versionSpec: ${{ inputs.gitversion_version }}
+
+      - name: Calculate semantic version
+        id: version
+        uses: GitTools/actions/gitversion/execute@7417b1089e2c7de93510f1901d656ddf60bb024f # v4.7.0
+        with:
+          configFilePath: ${{ inputs.config_file }}
+          # ContinuousDelivery appends a numeric prerelease even on main.
+          # This default produces stable tags on branches with an empty label.
+          overrideConfig: mode=ContinuousDeployment
+
+      - name: Create or verify the calling repository's version tag
+        id: tag
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          SEMANTIC_VERSION: ${{ steps.version.outputs.semVer }}
+          VERSION_SHA: ${{ steps.version.outputs.sha }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        with:
+          script: |
+            const version = process.env.SEMANTIC_VERSION;
+            const number = '(?:0|[1-9][0-9]*)';
+            const identifier = '(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)';
+            const semver = new RegExp(`^${number}\\.${number}\\.${number}(?:-${identifier}(?:\\.${identifier})*)?$`);
+            if (!semver.test(version)) {
+              throw new Error(`GitVersion returned an invalid version: ${version}`);
+            }
+            if (process.env.VERSION_SHA !== context.sha) {
+              throw new Error('GitVersion calculated a version for a different commit.');
+            }
+            const tag = `v${version}`;
+            core.setOutput('version', version);
+            core.setOutput('tag', tag);
+            core.setOutput('tag_created', 'false');
+            const summary = async message => {
+              core.info(message);
+              await core.summary.addHeading('Semantic tagging').addRaw(message).write();
+            };
+            if (process.env.DRY_RUN === 'true') {
+              await summary(`Dry run: ${tag} for ${context.sha}. No tag created.`);
+              return;
+            }
+            const branch = context.payload.repository.default_branch;
+            if (!['push', 'workflow_dispatch'].includes(context.eventName) ||
+                context.ref !== `refs/heads/${branch}` || context.payload.deleted) {
+              throw new Error('Tag creation requires a push or manual run on the default branch. Use dry_run for previews.');
+            }
+            if (version.includes('-')) {
+              throw new Error('Default-branch tagging requires a stable version, not a prerelease. Check GitVersion configuration.');
+            }
+            const repo = context.repo;
+            const ref = `tags/${tag}`;
+            const existingCommit = async () => {
+              let object;
+              try {
+                ({ data: { object } } = await github.rest.git.getRef({ ...repo, ref }));
+              } catch (error) {
+                if (error.status === 404) return null;
+                throw error;
+              }
+              // Existing annotated tags point to a tag object, not directly to a commit.
+              for (let depth = 0; object.type === 'tag' && depth < 10; depth++) {
+                ({ data: { object } } = await github.rest.git.getTag({ ...repo, tag_sha: object.sha }));
+              }
+              if (object.type !== 'commit') throw new Error(`${tag} does not resolve to a commit.`);
+              return object.sha;
+            };
+            const verify = sha => {
+              if (sha !== context.sha) {
+                throw new Error(`${tag} already points to ${sha}; refusing to move it to ${context.sha}.`);
+              }
+            };
+            const previous = await existingCommit();
+            if (previous !== null) {
+              verify(previous);
+              await summary(`${tag} already points to ${context.sha}. No change needed.`);
+              return;
+            }
+            try {
+              await github.rest.git.createRef({ ...repo, ref: `refs/${ref}`, sha: context.sha });
+            } catch (error) {
+              // A concurrent run may have created the same tag after our read.
+              if (error.status !== 422) throw error;
+              const concurrent = await existingCommit();
+              if (concurrent === null) throw error;
+              verify(concurrent);
+              await summary(`${tag} was created concurrently for ${context.sha}. No change needed.`);
+              return;
+            }
+            core.setOutput('tag_created', 'true');
+            await summary(`Created ${tag} at ${context.sha}.`);
