@@ -514,8 +514,8 @@ def get_server_activity(filepath=None):
     try:
         if filepath is None:
             filepath = '/app/temp/data_from_server.json'
-        if not os.path.exists(filepath):
-            filepath = '/app/temp/data_from_tautulli.json'
+            if not os.path.exists(filepath):
+                filepath = '/app/temp/data_from_tautulli.json'
 
         if not os.path.exists(filepath):
             # Normal for a scheduled/manual cleanup run (no argv webhook file) -
@@ -3853,32 +3853,40 @@ def should_trigger_processing(current_progress, trigger_percentage):
 
 def main():
     """Main entry point - FIXED webhook vs cleanup logic"""
-    # Single choke point for every webhook AND every cleanup run (scheduled,
-    # manual, movie) - held automation means nothing downloads, unmonitors,
-    # or deletes anything, without needing a separate check in each caller.
+    # No argument (or explicit --cleanup) is always cleanup. Never consume an
+    # unrelated legacy event file while running scheduled/manual cleanup.
+    if len(sys.argv) > 2:
+        logger.error("Expected --cleanup or one explicit webhook file")
+        raise SystemExit(1)
+    webhook_file = sys.argv[1] if len(sys.argv) > 1 else None
+    if webhook_file == '--cleanup':
+        webhook_file = None
+
+    if webhook_file is not None:
+        if not os.path.isfile(webhook_file):
+            logger.error("Explicit webhook file is missing or not a regular file")
+            raise SystemExit(1)
+        series_name, season_number, episode_number, thetvdb_id, themoviedb_id, prefetch_only = get_server_activity(webhook_file)
+        if not series_name:
+            logger.error("Explicit webhook file is invalid")
+            raise SystemExit(1)
+        try:
+            is_recent_webhook = 0 <= time.time() - os.path.getmtime(webhook_file) < 300
+        except OSError:
+            is_recent_webhook = False
+        if not is_recent_webhook:
+            logger.error("Explicit webhook file is stale or unavailable")
+            raise SystemExit(1)
+
+    # Validation cannot turn an explicit bad event into a cleanup run, even
+    # while automation is held. Valid work still respects the common hold.
     if load_global_settings().get('automation_held', False):
         logger.info("⏸️ Automation held - skipping webhook/cleanup processing")
         return False
 
-    # Webhook payload path: each integration (Jellyfin/Emby/Tautulli/Plex) now
-    # writes its own per-event temp file and passes it as argv[1], so
-    # concurrent events can't clobber each other's file. Cleanup/manual runs
-    # (webhooks.py's legacy /webhook route, scheduled cleanup) call this with
-    # no argv and fall back to the fixed legacy path.
-    webhook_file = sys.argv[1] if len(sys.argv) > 1 else '/app/temp/data_from_server.json'
-
-    # Check if this is a webhook call (has recent webhook data)
-    series_name, season_number, episode_number, thetvdb_id, themoviedb_id, prefetch_only = get_server_activity(webhook_file)
-
-    try:
-        # Check if webhook file is recent (within last few minutes)
-        if os.path.exists(webhook_file):
-            file_age = time.time() - os.path.getmtime(webhook_file)
-            is_recent_webhook = file_age < 300  # 5 minutes
-        else:
-            is_recent_webhook = False
-    except:
-        is_recent_webhook = False
+    if webhook_file is None:
+        run_unified_cleanup()
+        return False
 
     if series_name and is_recent_webhook:
         # Webhook mode - process the episode that was just watched
@@ -3897,10 +3905,7 @@ def main():
             else:
                 update_activity_date(series_id, season_number, episode_number)
             return True
-    else:
-        # Cleanup mode - run unified cleanup (manual or scheduled)
-        run_unified_cleanup()
-        return False
+    return False
 
 if __name__ == "__main__":
     main()

@@ -526,21 +526,28 @@ def handle_server_webhook():
             "rule": final_rule
         }
 
-        temp_file_path = os.path.join(temp_dir, 'data_from_server.json')
+        temp_file_path = os.path.join(temp_dir, f'data_from_server_{os.urandom(16).hex()}.json')
         with open(temp_file_path, 'w') as f:
             json.dump(plex_data, f)
 
         # ─── Original subprocess call ───
-        result = subprocess.run(
-            ["python3", os.path.join(os.getcwd(), "media_processor.py")],
-            capture_output=True,
-            text=True
-        )
+        try:
+            result = subprocess.run(
+                ["python3", os.path.join(os.getcwd(), "media_processor.py"), temp_file_path],
+                capture_output=True,
+                text=True
+            )
+        finally:
+            try:
+                os.remove(temp_file_path)
+            except OSError:
+                pass
 
         if result.returncode != 0:
             current_app.logger.error(f"media_processor.py failed with return code {result.returncode}")
             if result.stderr:
                 current_app.logger.error(f"Error output: {result.stderr}")
+            return jsonify({'status': 'error', 'message': 'Webhook processor failed'}), 500
         else:
             current_app.logger.info("media_processor.py completed successfully")
             if result.stderr:
